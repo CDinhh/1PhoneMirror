@@ -1339,7 +1339,12 @@ void Renderer::run() {
                 running_.store(false);
                 return;
 
+            case SDL_KEYUP:
+                android_forward_key_(event);
+                break;
+
             case SDL_KEYDOWN:
+                if (android_forward_key_(event)) break;
                 // When the Android panel is open, capture keys for editing.
                 if (android_panel_visible_) {
                     auto& fld = (android_focus_ == 0 ? android_ip_
@@ -1564,6 +1569,13 @@ void Renderer::run() {
                 break;
 
             case SDL_TEXTINPUT:
+                if (android_kbd_on_ && !android_panel_visible_ && android_input_active_()) {
+                    AndroidInput in;
+                    in.kind = AndroidInput::Kind::Text;
+                    in.text = event.text.text;
+                    android_input_fn_(in);
+                    break;
+                }
                 if (android_panel_visible_) {
                     auto& fld = (android_focus_ == 0 ? android_ip_
                               :  android_focus_ == 1 ? android_connect_port_
@@ -2499,6 +2511,18 @@ void Renderer::run() {
                             break;
                         }
                     }
+                    // Touch the phone: left-press inside the mirrored screen.
+                    if (!android_panel_visible_ && !info_panel_visible_ &&
+                        !version_panel_visible_ && !settings_panel_visible_ &&
+                        android_input_active_()) {
+                        int rx, ry, rw, rh;
+                        if (android_video_rect_(&rx, &ry, &rw, &rh) &&
+                            in_rect(mx, my, rx, ry, rw, rh)) {
+                            android_touch_down_ = true;
+                            android_send_touch_(0, mx, my);
+                            break;
+                        }
+                    }
                     // Bezel drag
                     if (phone_frame_enabled_ && frame_dst_w_ > 0) {
                         if (in_rect(mx, my, frame_dst_x_, frame_dst_y_,
@@ -2518,6 +2542,10 @@ void Renderer::run() {
                 break;
 
             case SDL_MOUSEMOTION:
+                if (android_touch_down_) {
+                    android_send_touch_(2, event.motion.x, event.motion.y);
+                    break;
+                }
                 if (android_help_dragging_ && android_help_track_rect_.h > 0 &&
                     android_help_thumb_rect_.h > 0 && android_help_max_scroll_ > 0) {
                     int my = event.motion.y;
@@ -2578,6 +2606,10 @@ void Renderer::run() {
 
             case SDL_MOUSEBUTTONUP:
                 if (event.button.button == SDL_BUTTON_LEFT) {
+                    if (android_touch_down_) {
+                        android_touch_down_ = false;
+                        android_send_touch_(1, event.button.x, event.button.y);
+                    }
                     if (resizing_) resizing_ = false;
                     if (log_scrollbar_dragging_) log_scrollbar_dragging_ = false;
                     if (version_scrollbar_dragging_) version_scrollbar_dragging_ = false;
@@ -2586,6 +2618,25 @@ void Renderer::run() {
                 break;
 
             case SDL_MOUSEWHEEL:
+                if (!android_panel_visible_ && !info_panel_visible_ &&
+                    !version_panel_visible_ && !settings_panel_visible_ &&
+                    android_input_active_()) {
+                    int wmx, wmy, rx, ry, rw, rh;
+                    SDL_GetMouseState(&wmx, &wmy);
+                    if (android_video_rect_(&rx, &ry, &rw, &rh) &&
+                        in_rect(wmx, wmy, rx, ry, rw, rh)) {
+                        AndroidInput in;
+                        in.kind = AndroidInput::Kind::Scroll;
+                        in.x = std::max(0, std::min(tex_width_ - 1, (wmx - rx) * tex_width_ / rw));
+                        in.y = std::max(0, std::min(tex_height_ - 1, (wmy - ry) * tex_height_ / rh));
+                        in.frame_w = tex_width_;
+                        in.frame_h = tex_height_;
+                        in.hscroll = (float)std::max(-1, std::min(1, event.wheel.x));
+                        in.vscroll = (float)std::max(-1, std::min(1, event.wheel.y));
+                        android_input_fn_(in);
+                        break;
+                    }
+                }
                 if (android_panel_visible_ && android_help_visible_) {
                     int scroll_amount = std::max(20, frame_dst_w_ / 18);
                     android_help_scroll_ -= event.wheel.y * scroll_amount;
@@ -6686,6 +6737,130 @@ void Renderer::draw_android_qr(int svx, int svy, int svw, int svh) {
             SDL_DestroyTexture(tex);
         }
     }
+}
+
+bool Renderer::android_input_active_() {
+    if (!android_input_fn_ || !active_platform_fn_ || !texture_ || !ever_received_frame_)
+        return false;
+    return active_platform_fn_() == "Android";
+}
+
+// Where the mirrored video is drawn (same geometry as render_frame()).
+bool Renderer::android_video_rect_(int* x, int* y, int* w, int* h) {
+    if (frame_dst_w_ <= 0 || tex_width_ <= 0 || tex_height_ <= 0 ||
+        phone_frame_.frame_width() <= 0)
+        return false;
+    float scale = (float)frame_dst_w_ / phone_frame_.frame_width();
+    int svx = frame_dst_x_ + (int)std::round(phone_frame_.screen_x() * scale);
+    int svy = frame_dst_y_ + (int)std::round(phone_frame_.screen_y() * scale);
+    int svw = (int)std::round(phone_frame_.screen_width() * scale);
+    int svh = (int)std::round(phone_frame_.screen_height() * scale);
+    int vx = svx - 1, vy = svy - 1, vw = svw + 2, vh = svh + 2;
+    if (vw <= 0 || vh <= 0) return false;
+    float tex_ar = (float)tex_width_ / (float)tex_height_;
+    float rect_ar = (float)vw / (float)vh;
+    if (std::abs(tex_ar - rect_ar) > 0.05f * rect_ar) {
+        int fw, fh;
+        if (tex_ar > rect_ar) { fw = vw; fh = (int)std::round(vw / tex_ar); }
+        else                  { fh = vh; fw = (int)std::round(vh * tex_ar); }
+        vx += (vw - fw) / 2; vy += (vh - fh) / 2; vw = fw; vh = fh;
+    }
+    if (vw <= 0 || vh <= 0) return false;
+    *x = vx; *y = vy; *w = vw; *h = vh;
+    return true;
+}
+
+void Renderer::android_send_touch_(int action, int mx, int my) {
+    int rx, ry, rw, rh;
+    if (!android_input_fn_ || !android_video_rect_(&rx, &ry, &rw, &rh)) return;
+    AndroidInput in;
+    in.kind = AndroidInput::Kind::Touch;
+    in.action = action;
+    in.x = std::max(0, std::min(tex_width_ - 1, (mx - rx) * tex_width_ / rw));
+    in.y = std::max(0, std::min(tex_height_ - 1, (my - ry) * tex_height_ / rh));
+    in.frame_w = tex_width_;
+    in.frame_h = tex_height_;
+    android_input_fn_(in);
+}
+
+// Returns true when the key event was consumed (sent to the phone).
+bool Renderer::android_forward_key_(const SDL_Event& ev) {
+    if (android_panel_visible_ || !android_input_active_()) return false;
+    const bool down = (ev.type == SDL_KEYDOWN);
+    const SDL_Keycode k = ev.key.keysym.sym;
+    const uint16_t mod = ev.key.keysym.mod;
+    const bool ctrl = (mod & KMOD_CTRL) != 0;
+    const bool alt  = (mod & KMOD_ALT) != 0;
+
+    auto key = [&](int action, int code) {
+        AndroidInput in;
+        in.kind = AndroidInput::Kind::Key;
+        in.action = action;
+        in.keycode = code;
+        android_input_fn_(in);
+    };
+    auto tap = [&](int code) { key(0, code); key(1, code); };
+    auto toast = [&](const char* s) {
+        toast_text_ = s;
+        toast_active_ = true;
+        toast_start_ = std::chrono::steady_clock::now();
+    };
+
+    // Shortcuts that work whenever an Android phone is mirrored.
+    if (ctrl && !alt) {
+        switch (k) {
+            case SDLK_k:
+                if (down && !ev.key.repeat) {
+                    android_kbd_on_ = !android_kbd_on_;
+                    if (android_kbd_on_) SDL_StartTextInput(); else SDL_StopTextInput();
+                    toast(android_kbd_on_ ? "Keyboard -> phone: ON (Ctrl+K to turn off)"
+                                          : "Keyboard -> phone: OFF");
+                }
+                return true;
+            case SDLK_b: if (down && !ev.key.repeat) tap(4);   return true;  // BACK
+            case SDLK_h: if (down && !ev.key.repeat) tap(3);   return true;  // HOME
+            case SDLK_e: if (down && !ev.key.repeat) tap(187); return true;  // APP_SWITCH
+            case SDLK_p: if (down && !ev.key.repeat) tap(26);  return true;  // POWER
+            case SDLK_v:
+                if (!android_kbd_on_) return false;
+                if (down && !ev.key.repeat) {
+                    char* clip = SDL_GetClipboardText();
+                    if (clip && *clip) {
+                        AndroidInput in;
+                        in.kind = AndroidInput::Kind::Clipboard;
+                        in.text = clip;
+                        android_input_fn_(in);
+                    }
+                    if (clip) SDL_free(clip);
+                }
+                return true;
+            default: return false;   // Ctrl+S / Ctrl+R / ... stay with the app
+        }
+    }
+
+    if (!android_kbd_on_) return false;   // plain keys keep their app shortcuts
+    SDL_StartTextInput();                 // the panel may have switched it off
+    if (ctrl || alt) return false;
+
+    int code = 0;
+    switch (k) {
+        case SDLK_RETURN: case SDLK_KP_ENTER: code = 66; break;
+        case SDLK_BACKSPACE: code = 67; break;
+        case SDLK_TAB:       code = 61; break;
+        case SDLK_ESCAPE:    code = 4;  break;
+        case SDLK_DELETE:    code = 112; break;
+        case SDLK_UP:        code = 19; break;
+        case SDLK_DOWN:      code = 20; break;
+        case SDLK_LEFT:      code = 21; break;
+        case SDLK_RIGHT:     code = 22; break;
+        case SDLK_HOME:      code = 122; break;
+        case SDLK_END:       code = 123; break;
+        case SDLK_PAGEUP:    code = 92; break;
+        case SDLK_PAGEDOWN:  code = 93; break;
+        default: break;
+    }
+    if (code) key(down ? 0 : 1, code);
+    return true;   // printable keys arrive as SDL_TEXTINPUT
 }
 
 void Renderer::android_usb_start() {

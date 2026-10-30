@@ -320,6 +320,22 @@ std::string App::android_pair_via_qr(const std::string& name,
     return android_finish_connect_(ip, pair_addr);
 }
 
+void App::android_send_input(const media::Renderer::AndroidInput& in) {
+    using Kind = media::Renderer::AndroidInput::Kind;
+    std::lock_guard lk(scrcpy_mutex_);
+    android::ScrcpyReceiver* rx = nullptr;
+    for (auto& s : scrcpy_sessions_)
+        if (s && s->receiver && s->serial == active_android_serial_) { rx = s->receiver.get(); break; }
+    if (!rx || !rx->control_ready()) return;
+    switch (in.kind) {
+        case Kind::Touch:     rx->send_touch(in.action, in.x, in.y, in.frame_w, in.frame_h); break;
+        case Kind::Scroll:    rx->send_scroll(in.x, in.y, in.frame_w, in.frame_h, in.hscroll, in.vscroll); break;
+        case Kind::Key:       rx->send_key(in.action, in.keycode); break;
+        case Kind::Text:      rx->send_text(in.text); break;
+        case Kind::Clipboard: rx->send_clipboard(in.text, /*paste=*/true); break;
+    }
+}
+
 std::string App::android_connect_usb() {
     if (android_jar_path_.empty())
         return "scrcpy-server.jar not found in tools/";

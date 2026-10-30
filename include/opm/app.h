@@ -67,6 +67,9 @@ public:
                                          const std::string& pair_port,
                                          const std::string& pin,
                                          const std::string& connect_port = "");
+    // Forwards a mouse/keyboard event from the window to the active phone.
+    void android_send_input(const media::Renderer::AndroidInput& in);
+
     // Mirror a phone plugged in with a USB cable (USB debugging on). Picks
     // the first USB device that is not already mirrored. Returns
     // "Mirroring <serial>" on success, otherwise a human-readable reason.

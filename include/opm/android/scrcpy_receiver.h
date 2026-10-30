@@ -7,6 +7,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -117,6 +118,7 @@ public:
         int max_size = 1920;                  // resize-to-fit-square pixels
         int bit_rate = 8'000'000;             // bits/s (H.264)
         int max_fps = 60;
+        bool control = true;                  // open the control channel (mouse/keyboard)
     };
 
     // Spawns the scrcpy server on the device, opens the reverse tunnel,
@@ -136,7 +138,22 @@ public:
     int video_width() const  { return video_w_; }
     int video_height() const { return video_h_; }
 
+    // ---- Input injection (scrcpy control channel). All calls are cheap,
+    // thread-safe and silently ignored if the control channel is not up.
+    // Coordinates are in video pixels; (fw, fh) is the video frame size the
+    // coordinates refer to.
+    bool control_ready() const { return ctrl_sock_ != (uintptr_t)-1; }
+    // action: 0 = down, 1 = up, 2 = move.
+    void send_touch(int action, int x, int y, int fw, int fh);
+    void send_scroll(int x, int y, int fw, int fh, float hscroll, float vscroll);
+    // action: 0 = down, 1 = up. keycode = Android KEYCODE_*.
+    void send_key(int action, int keycode, int meta = 0);
+    void send_text(const std::string& utf8);
+    // Sets the phone clipboard and (if paste) pastes it.
+    void send_clipboard(const std::string& utf8, bool paste);
+
 private:
+    bool send_ctrl_(const uint8_t* data, size_t n);
     void worker_();
 
     Config cfg_;
@@ -158,6 +175,10 @@ private:
     // dragging in <winsock2.h> / <windows.h> for every translation unit.
     uintptr_t sock_ = (uintptr_t)-1;   // SOCKET / int
     void*     server_proc_ = nullptr;  // HANDLE on Windows
+    uintptr_t ctrl_sock_ = (uintptr_t)-1;  // control channel (or -1)
+    std::mutex ctrl_mutex_;
+    std::thread ctrl_drain_;                // discards device->PC messages
+    uint64_t clip_seq_ = 1;
 };
 
 } // namespace opm::android

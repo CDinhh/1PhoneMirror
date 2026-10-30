@@ -123,6 +123,21 @@ public:
         std::function<bool()> cancelled)>;
     void set_android_qr_handler(AndroidQrFn fn) { android_qr_fn_ = std::move(fn); }
 
+    // Input forwarding to the mirrored Android phone (scrcpy control channel):
+    // left-drag = touch, wheel = scroll, Ctrl+B/H/E/P = Back/Home/Recents/Power,
+    // Ctrl+K toggles keyboard forwarding (typing, Ctrl+V pastes the PC clipboard).
+    struct AndroidInput {
+        enum class Kind { Touch, Scroll, Key, Text, Clipboard } kind = Kind::Touch;
+        int action = 0;               // Touch: 0 down, 1 up, 2 move. Key: 0 down, 1 up.
+        int x = 0, y = 0;             // source-video pixels
+        int frame_w = 0, frame_h = 0; // size of the frame x/y refer to
+        float hscroll = 0, vscroll = 0;
+        int keycode = 0;              // Android KEYCODE_*
+        std::string text;             // Text / Clipboard
+    };
+    using AndroidInputFn = std::function<void(const AndroidInput&)>;
+    void set_android_input_handler(AndroidInputFn fn) { android_input_fn_ = std::move(fn); }
+
     // USB-cable mode: the handler looks for a phone on USB and starts
     // mirroring it; returns "Mirroring <serial>" or an explanation.
     using AndroidUsbFn = std::function<std::string()>;
@@ -768,6 +783,15 @@ private:
     BtnRect android_qr_cancel_btn_;            // "Cancel" in QR mode
     void android_qr_start();
     AndroidUsbFn android_usb_fn_;
+
+    // Phone input forwarding.
+    AndroidInputFn android_input_fn_;
+    bool android_kbd_on_ = false;       // keyboard forwarding (Ctrl+K)
+    bool android_touch_down_ = false;   // left button held on the phone screen
+    bool android_input_active_();
+    bool android_video_rect_(int* x, int* y, int* w, int* h);
+    void android_send_touch_(int action, int mx, int my);
+    bool android_forward_key_(const SDL_Event& ev);
     BtnRect android_usb_btn_;                  // "USB cable" on the form
     void android_usb_start();
     void android_qr_stop();

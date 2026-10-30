@@ -365,7 +365,7 @@ bool ScrcpyReceiver::start(const Config& cfg, AdbController& adb) {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(cfg.local_port);
     if (::bind(listen_sock, (sockaddr*)&addr, sizeof(addr)) != 0 ||
-        ::listen(listen_sock, 1) != 0) {
+        ::listen(listen_sock, 2) != 0) {
         std::cerr << "[scrcpy] could not bind 127.0.0.1:" << cfg.local_port << "\n";
         CLOSESOCK(listen_sock);
         return false;
@@ -389,7 +389,7 @@ bool ScrcpyReceiver::start(const Config& cfg, AdbController& adb) {
         "app_process / com.genymobile.scrcpy.Server " + cfg.scrcpy_version +
         " video_codec=h264" +
         " audio=false" +
-        " control=false" +
+        (cfg.control ? " control=true" : " control=false") +
         " max_size=" + std::to_string(cfg.max_size) +
         " video_bit_rate=" + std::to_string(cfg.bit_rate) +
         " max_fps=" + std::to_string(cfg.max_fps) +
@@ -424,6 +424,16 @@ bool ScrcpyReceiver::start(const Config& cfg, AdbController& adb) {
         return false;
     }
     socket_t s = ::accept(listen_sock, nullptr, nullptr);
+    // With control=true the server opens a second connection (after video).
+    socket_t cs = INVALID_SOCK;
+    if (s != INVALID_SOCK && cfg.control) {
+        fd_set r2; FD_ZERO(&r2); FD_SET(listen_sock, &r2);
+        timeval tv2{5, 0};
+        if (select((int)listen_sock + 1, &r2, nullptr, nullptr, &tv2) > 0)
+            cs = ::accept(listen_sock, nullptr, nullptr);
+        if (cs == INVALID_SOCK)
+            std::cerr << "[scrcpy] control channel did not connect; view-only\n";
+    }
     CLOSESOCK(listen_sock);
     if (s == INVALID_SOCK) {
         std::cerr << "[scrcpy] accept() failed\n";
@@ -431,7 +441,21 @@ bool ScrcpyReceiver::start(const Config& cfg, AdbController& adb) {
         return false;
     }
     sock_ = (uintptr_t)s;
-    std::cout << "[scrcpy] device connected\n";
+    if (cs != INVALID_SOCK) {
+        int nodelay = 1;
+        setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+        ctrl_sock_ = (uintptr_t)cs;
+        // The server may send clipboard / ack messages; read and drop them so
+        // its send buffer never fills up.
+        ctrl_drain_ = std::thread([cs] {
+            char buf[4096];
+            while (true) {
+                int n = ::recv(cs, buf, (int)sizeof(buf), 0);
+                if (n <= 0) break;
+            }
+        });
+    }
+    std::cout << "[scrcpy] device connected" << (cs != INVALID_SOCK ? " (control on)" : "") << "\n";
 
     running_.store(true);
     thread_ = std::thread([this] { worker_(); });
@@ -450,6 +474,25 @@ void ScrcpyReceiver::stop() {
 #endif
     }
     if (was_running && thread_.joinable()) thread_.join();
+
+    {
+        std::lock_guard lk(ctrl_mutex_);
+        if (ctrl_sock_ != (uintptr_t)INVALID_SOCK) {
+#ifdef _WIN32
+            shutdown((socket_t)ctrl_sock_, SD_BOTH);
+#else
+            shutdown((socket_t)ctrl_sock_, SHUT_RDWR);
+#endif
+        }
+    }
+    if (ctrl_drain_.joinable()) ctrl_drain_.join();
+    {
+        std::lock_guard lk(ctrl_mutex_);
+        if (ctrl_sock_ != (uintptr_t)INVALID_SOCK) {
+            CLOSESOCK((socket_t)ctrl_sock_);
+            ctrl_sock_ = (uintptr_t)INVALID_SOCK;
+        }
+    }
 
     if (sock_ != (uintptr_t)INVALID_SOCK) {
         CLOSESOCK((socket_t)sock_);
@@ -539,6 +582,113 @@ void ScrcpyReceiver::worker_() {
 
     std::cout << "[scrcpy] stream ended\n";
     if (on_disconnect_) on_disconnect_();
+}
+
+
+// ---------------------------------------------------------------------------
+// Control channel (scrcpy v3.0 control_msg.c wire format, big-endian)
+// ---------------------------------------------------------------------------
+namespace {
+inline void put16(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+inline void put32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+inline void put64(uint8_t* p, uint64_t v) { put32(p, (uint32_t)(v >> 32)); put32(p + 4, (uint32_t)v); }
+// Longest prefix of `s` that is <= max bytes and does not cut a UTF-8 char.
+size_t utf8_prefix(const std::string& s, size_t max) {
+    if (s.size() <= max) return s.size();
+    size_t n = max;
+    while (n > 0 && (static_cast<uint8_t>(s[n]) & 0xC0) == 0x80) --n;
+    return n;
+}
+enum : uint8_t {
+    MSG_KEYCODE = 0, MSG_TEXT = 1, MSG_TOUCH = 2, MSG_SCROLL = 3,
+    MSG_SET_CLIPBOARD = 9,
+};
+} // namespace
+
+bool ScrcpyReceiver::send_ctrl_(const uint8_t* data, size_t n) {
+    std::lock_guard lk(ctrl_mutex_);
+    if (ctrl_sock_ == (uintptr_t)INVALID_SOCK) return false;
+    socket_t s = (socket_t)ctrl_sock_;
+    size_t off = 0;
+    while (off < n) {
+        int w = ::send(s, (const char*)data + off, (int)(n - off), 0);
+        if (w <= 0) return false;
+        off += (size_t)w;
+    }
+    return true;
+}
+
+void ScrcpyReceiver::send_touch(int action, int x, int y, int fw, int fh) {
+    if (!control_ready() || fw <= 0 || fh <= 0) return;
+    uint8_t b[32] = {};
+    b[0] = MSG_TOUCH;
+    b[1] = (uint8_t)action;                       // 0 down, 1 up, 2 move
+    put64(b + 2, UINT64_MAX);                     // SC_POINTER_ID_MOUSE
+    put32(b + 10, (uint32_t)x);
+    put32(b + 14, (uint32_t)y);
+    put16(b + 18, (uint32_t)fw);
+    put16(b + 20, (uint32_t)fh);
+    put16(b + 22, action == 1 ? 0 : 0xffff);      // pressure
+    put32(b + 24, 1);                             // action button: primary
+    put32(b + 28, action == 1 ? 0 : 1);           // buttons held
+    send_ctrl_(b, sizeof(b));
+}
+
+void ScrcpyReceiver::send_scroll(int x, int y, int fw, int fh, float hs, float vs) {
+    if (!control_ready() || fw <= 0 || fh <= 0) return;
+    auto fp = [](float f) {
+        if (f > 1.0f) f = 1.0f;
+        if (f < -1.0f) f = -1.0f;
+        int32_t i = (int32_t)(f * 32768.0f);
+        if (i >= 0x7fff) i = 0x7fff;
+        if (i < -0x8000) i = -0x8000;
+        return (uint16_t)(int16_t)i;
+    };
+    uint8_t b[21] = {};
+    b[0] = MSG_SCROLL;
+    put32(b + 1, (uint32_t)x);
+    put32(b + 5, (uint32_t)y);
+    put16(b + 9, (uint32_t)fw);
+    put16(b + 11, (uint32_t)fh);
+    put16(b + 13, fp(hs));
+    put16(b + 15, fp(vs));
+    put32(b + 17, 0);
+    send_ctrl_(b, sizeof(b));
+}
+
+void ScrcpyReceiver::send_key(int action, int keycode, int meta) {
+    if (!control_ready()) return;
+    uint8_t b[14] = {};
+    b[0] = MSG_KEYCODE;
+    b[1] = (uint8_t)action;
+    put32(b + 2, (uint32_t)keycode);
+    put32(b + 6, 0);
+    put32(b + 10, (uint32_t)meta);
+    send_ctrl_(b, sizeof(b));
+}
+
+void ScrcpyReceiver::send_text(const std::string& s) {
+    if (!control_ready() || s.empty()) return;
+    size_t n = utf8_prefix(s, 300);
+    std::vector<uint8_t> b(5 + n);
+    b[0] = MSG_TEXT;
+    put32(b.data() + 1, (uint32_t)n);
+    memcpy(b.data() + 5, s.data(), n);
+    send_ctrl_(b.data(), b.size());
+}
+
+void ScrcpyReceiver::send_clipboard(const std::string& s, bool paste) {
+    if (!control_ready() || s.empty()) return;
+    size_t n = utf8_prefix(s, 256 * 1024);
+    std::vector<uint8_t> b(14 + n);
+    b[0] = MSG_SET_CLIPBOARD;
+    put64(b.data() + 1, clip_seq_++);
+    b[9] = paste ? 1 : 0;
+    put32(b.data() + 10, (uint32_t)n);
+    memcpy(b.data() + 14, s.data(), n);
+    send_ctrl_(b.data(), b.size());
 }
 
 } // namespace opm::android
