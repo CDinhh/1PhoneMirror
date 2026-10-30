@@ -1,5 +1,12 @@
 # 1PhoneMirror
 
+> **Fork notes (v0.7.0)** - this fork of [MSEndpointMgr/1PhoneMirror](https://github.com/MSEndpointMgr/1PhoneMirror) adds, for Android:
+> pairing by **QR code**, mirroring over a **USB cable**, and **PC control** (mouse = touch, wheel = scroll,
+> `Ctrl+B/H/E/P` = Back/Home/Recents/Power, `Ctrl+K` = keyboard to phone, `Ctrl+V` = paste PC clipboard).
+> Download the MSI or portable zip from [Releases](https://github.com/CDinhh/1PhoneMirror/releases/latest)
+> (unsigned: SmartScreen shows *More info > Run anyway*). iPhone/iPad stays view-only (AirPlay over Wi-Fi).
+> GPL-3.0, see [LICENSE](LICENSE).
+
 An open-source screen-mirroring receiver for Windows that lets an iPhone or
 an Android phone show up inside a phone-shaped window on your PC — no app
 installed on the phone, no cables.
