@@ -18,6 +18,7 @@
 #include <memory>
 #include <random>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <SDL.h>
@@ -567,6 +568,109 @@ static void fill_circle(SDL_Renderer* r, int cx, int cy, int radius) {
     }
 }
 
+static void fill_round_rect(SDL_Renderer* r, int x, int y, int w, int h, int rad) {
+    rad = std::max(0, std::min(rad, std::min(w, h) / 2));
+    SDL_Rect a = {x + rad, y, w - rad * 2, h};
+    SDL_RenderFillRect(r, &a);
+    SDL_Rect b = {x, y + rad, rad, h - rad * 2};
+    SDL_RenderFillRect(r, &b);
+    SDL_Rect d = {x + w - rad, y + rad, rad, h - rad * 2};
+    SDL_RenderFillRect(r, &d);
+    fill_circle(r, x + rad, y + rad, rad);
+    fill_circle(r, x + w - rad - 1, y + rad, rad);
+    fill_circle(r, x + rad, y + h - rad - 1, rad);
+    fill_circle(r, x + w - rad - 1, y + h - rad - 1, rad);
+}
+
+#ifdef _WIN32
+// ---------------------------------------------------------------------------
+// Icon-font glyphs + cached text. Glyph/text textures are rendered white once
+// per (code, size) and tinted with SDL colour/alpha mod, so drawing them every
+// frame costs one SDL_RenderCopy.
+// ---------------------------------------------------------------------------
+namespace {
+struct CachedTex { SDL_Texture* tex = nullptr; int w = 0, h = 0; };
+
+std::unordered_map<std::string, CachedTex>& tex_cache() {
+    static std::unordered_map<std::string, CachedTex> m;
+    return m;
+}
+
+void tex_cache_trim() {
+    auto& m = tex_cache();
+    if (m.size() < 600) return;   // window being resized: drop stale sizes
+    for (auto& kv : m) if (kv.second.tex) SDL_DestroyTexture(kv.second.tex);
+    m.clear();
+}
+
+// Segoe Fluent Icons ships with Windows 11; Windows 10 has Segoe MDL2 Assets
+// (same code points for everything used here).
+const wchar_t* icon_font_name() {
+    static const wchar_t* name = []() -> const wchar_t* {
+        wchar_t win[MAX_PATH] = {};
+        GetWindowsDirectoryW(win, MAX_PATH);
+        std::wstring p = std::wstring(win) + L"\\Fonts\\SegoeIcons.ttf";
+        return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES
+                   ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets";
+    }();
+    return name;
+}
+} // namespace
+
+// Draws icon-font glyph `cp` centred on (cx, cy), `px` pixels tall.
+static void draw_glyph(SDL_Renderer* r, wchar_t cp, int cx, int cy, int px,
+                       uint8_t cr, uint8_t cg, uint8_t cb, uint8_t ca) {
+    tex_cache_trim();
+    auto& c = tex_cache()["g:" + std::to_string((int)cp) + ":" + std::to_string(px)];
+    if (!c.tex)
+        c.tex = make_text_texture_w(r, std::wstring(1, cp), px, 255, 255, 255,
+                                    &c.w, &c.h, icon_font_name());
+    if (!c.tex) return;
+    int ink_w = c.w - (px + 3) / 4;   // strip the right padding the helper adds
+    SDL_SetTextureColorMod(c.tex, cr, cg, cb);
+    SDL_SetTextureAlphaMod(c.tex, ca);
+    SDL_Rect d = {cx - ink_w / 2, cy - c.h / 2, c.w, c.h};
+    SDL_RenderCopy(r, c.tex, nullptr, &d);
+}
+
+// Measures cached text (ink width, line height).
+static void measure_text_c(SDL_Renderer* r, const std::string& s, int px, int* w, int* h) {
+    tex_cache_trim();
+    auto& c = tex_cache()["t:" + std::to_string(px) + ":" + s];
+    if (!c.tex) c.tex = make_text_texture(r, s, px, 255, 255, 255, &c.w, &c.h);
+    *w = c.tex ? c.w - (px + 3) / 4 : 0;
+    *h = c.tex ? c.h : 0;
+}
+
+// Draws cached text. align: 0 = x is the left edge, 1 = centred on x, 2 = right edge.
+// Returns the line height.
+static int draw_text_c(SDL_Renderer* r, const std::string& s, int px,
+                       uint8_t cr, uint8_t cg, uint8_t cb, uint8_t ca,
+                       int x, int y, int align) {
+    int w = 0, h = 0;
+    measure_text_c(r, s, px, &w, &h);
+    auto& c = tex_cache()["t:" + std::to_string(px) + ":" + s];
+    if (!c.tex) return 0;
+    int dx = align == 1 ? x - w / 2 : (align == 2 ? x - w : x);
+    SDL_SetTextureColorMod(c.tex, cr, cg, cb);
+    SDL_SetTextureAlphaMod(c.tex, ca);
+    SDL_Rect d = {dx, y, c.w, c.h};
+    SDL_RenderCopy(r, c.tex, nullptr, &d);
+    return c.h;
+}
+
+// Largest font size <= px at which `s` fits in max_w.
+static int fit_text_px(SDL_Renderer* r, const std::string& s, int px, int max_w) {
+    int w = 0, h = 0;
+    while (px > 8) {
+        measure_text_c(r, s, px, &w, &h);
+        if (w <= max_w) break;
+        --px;
+    }
+    return px;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Platform icon generators (128px monochrome, downscaled for crispness)
 // ---------------------------------------------------------------------------
@@ -867,28 +971,6 @@ bool Renderer::init(const std::string& title, int /*width*/, int /*height*/) {
             fs.tex = make_text_texture_w(sdl_renderer_, text, 40, r, g, b, &fs.w, &fs.h, font);
             return fs;
         };
-        // Line 1: "1PhoneMirror by MSEndpointMgr"
-        footer_line1_.push_back(seg(L"1PhoneMirror by ", 120, 120, 120));
-        footer_line1_.push_back(seg(L"MSEndpointMgr", 120, 120, 120,
-                                     "https://msendpointmgr.com/", "Open MSEndpointMgr"));
-        // Line 2: "(c) 2026 \u266B Simon Skotheimsvik, MVP \u00B7 v0.3.8"
-        footer_line2_.push_back(seg(L"\u00A9 2026 ", 100, 100, 100));
-        // Beamed-eighth-notes glyph — render via Segoe UI Symbol so it works
-        // on Windows builds where the regular Segoe UI font lacks U+266B.
-        footer_line2_.push_back(seg(L"\u266B", 100, 100, 100,
-                                     "", "Tuned carefully for the community",
-                                     L"Segoe UI Symbol"));
-        footer_line2_.push_back(seg(L" ", 100, 100, 100));
-        footer_line2_.push_back(seg(L"Simon Skotheimsvik, MVP", 100, 100, 100,
-                                     "https://linktr.ee/simonskotheimsvik", "More info of Simon"));
-        // Buy-me-a-coffee link — yellow coffee glyph (U+2615) sandwiched
-        // between the author name and the version number. Rendered via
-        // Segoe UI Symbol/Emoji so the glyph is present on stock Windows.
-        footer_line2_.push_back(seg(L" ", 100, 100, 100));
-        footer_line2_.push_back(seg(L"\u2615", 230, 200, 60,
-                                     "https://buymeacoffee.com/simonskothn",
-                                     "Buy me a coffee",
-                                     L"Segoe UI Symbol"));
         // Line 3: " · v<version>" — broken onto its own line so the second
         // line stays a comfortable width on narrow phone aspects. Version
         // string is built at runtime from OPM_VERSION_* (set by CMake) so
@@ -896,7 +978,7 @@ bool Renderer::init(const std::string& title, int /*width*/, int /*height*/) {
         std::wstring ver_w = L"v" + std::to_wstring(OPM_VERSION_MAJOR) +
                               L"." + std::to_wstring(OPM_VERSION_MINOR) +
                               L"." + std::to_wstring(OPM_VERSION_PATCH);
-        footer_line3_.push_back(seg(ver_w.c_str(), 100, 100, 100,
+        footer_line3_.push_back(seg(ver_w.c_str(), 255, 255, 255,
                                      "", "Version history (V)"));
 
         // Mirror the same content for the Info panel, but baked at the
@@ -911,22 +993,7 @@ bool Renderer::init(const std::string& title, int /*width*/, int /*height*/) {
             fs.tex = make_text_texture_w(sdl_renderer_, text, 30, r, g, b, &fs.w, &fs.h, font);
             return fs;
         };
-        info_footer_line1_.push_back(iseg(L"1PhoneMirror by ", 130, 130, 130));
-        info_footer_line1_.push_back(iseg(L"MSEndpointMgr", 130, 130, 130,
-                                           "https://msendpointmgr.com/", "Open MSEndpointMgr"));
-        info_footer_line2_.push_back(iseg(L"\u00A9 2026 ", 130, 130, 130));
-        info_footer_line2_.push_back(iseg(L"\u266B", 130, 130, 130,
-                                           "", "Tuned carefully for the community",
-                                           L"Segoe UI Symbol"));
-        info_footer_line2_.push_back(iseg(L" ", 130, 130, 130));
-        info_footer_line2_.push_back(iseg(L"Simon Skotheimsvik, MVP", 130, 130, 130,
-                                           "https://linktr.ee/simonskotheimsvik", "More info of Simon"));
-        info_footer_line2_.push_back(iseg(L" ", 130, 130, 130));
-        info_footer_line2_.push_back(iseg(L"\u2615", 230, 200, 60,
-                                           "https://buymeacoffee.com/simonskothn",
-                                           "Buy me a coffee",
-                                           L"Segoe UI Symbol"));
-        info_footer_line3_.push_back(iseg(ver_w.c_str(), 130, 130, 130,
+        info_footer_line1_.push_back(iseg(ver_w.c_str(), 130, 130, 130,
                                            "", "Version history (V)"));
     }
 #endif
@@ -1097,7 +1164,7 @@ bool Renderer::init(const std::string& title, int /*width*/, int /*height*/) {
 #ifdef _WIN32
     char pictures[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_MYPICTURES, nullptr, 0, pictures)))
-        screenshot_dir_ = std::string(pictures) + "\\1PhoneMirror by MSEndpointMgr";
+        screenshot_dir_ = std::string(pictures) + "\\1PhoneMirror";
     else
         screenshot_dir_ = "screenshots";
 #else
@@ -1578,6 +1645,10 @@ void Renderer::run() {
                     }
                     if (in(android_qr_btn_) && !android_busy_) {
                         android_qr_start();
+                        break;
+                    }
+                    if (in(android_usb_btn_) && !android_busy_) {
+                        android_usb_start();
                         break;
                     }
                     if (in(android_close_btn_)) {
@@ -3019,67 +3090,95 @@ void Renderer::render_frame() {
         }
     } else {
         // --- Waiting screen ---
-        SDL_SetRenderDrawColor(sdl_renderer_, 0, 0, 0, 255);
+        SDL_SetRenderDrawBlendMode(sdl_renderer_, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(sdl_renderer_, 7, 9, 18, 255);
         SDL_RenderClear(sdl_renderer_);
-
-        // Logo (or icon fallback) centered in top third
-        if (logo_texture_) {
-            // Scale logo to fit nicely: max width 60% of screen, max height 25% of screen
-            float logo_max_w = svw * 0.6f;
-            float logo_max_h = svh * 0.25f;
-            float logo_scale = std::min(logo_max_w / logo_tex_w_, logo_max_h / logo_tex_h_);
-            int lw = (int)(logo_tex_w_ * logo_scale);
-            int lh = (int)(logo_tex_h_ * logo_scale);
-            SDL_Rect lr = {svx + (svw - lw) / 2, svy + svh / 5 - lh / 2, lw, lh};
-            SDL_RenderCopy(sdl_renderer_, logo_texture_, nullptr, &lr);
-        } else if (icon_texture_) {
-            int icon_sz = std::max(32, svw / 4);
-            SDL_Rect ir = {svx + (svw - icon_sz) / 2, svy + svh / 4 - icon_sz / 2,
-                           icon_sz, icon_sz};
-            SDL_RenderCopy(sdl_renderer_, icon_texture_, nullptr, &ir);
-        }
-
-        // "Waiting for connection..." text
-        if (waiting_tex_) {
-            float ts = std::min(1.0f, svw * 0.6f / waiting_tex_w_);
-            int tw = (int)(waiting_tex_w_ * ts), th = (int)(waiting_tex_h_ * ts);
-            int wait_y = svy + (int)(svh * 0.36f);
-            SDL_Rect tr = {svx + (svw - tw) / 2, wait_y, tw, th};
-            SDL_RenderCopy(sdl_renderer_, waiting_tex_, nullptr, &tr);
-        }
-
-        // Cast instructions below waiting text — icon centered on its own line, text below
         {
-            int instr_y = svy + (int)(svh * 0.46f);
-            int icon_text_gap = (int)(svh * 0.005f);
-            int section_spacing = (int)(svh * 0.04f);
-            int icon_disp_sz = std::max(36, svw / 6); // larger centered icon
-
-            if (ios_icon_tex_ && ios_instr_tex_) {
-                // Icon centered
-                SDL_Rect icr = {svx + (svw - icon_disp_sz) / 2, instr_y, icon_disp_sz, icon_disp_sz};
-                SDL_RenderCopy(sdl_renderer_, ios_icon_tex_, nullptr, &icr);
-                instr_y += icon_disp_sz + icon_text_gap;
-                // Text centered below icon
-                float is = std::min(1.0f, svw * 0.85f / (float)ios_instr_w_);
-                int iw = (int)(ios_instr_w_ * is), ih = (int)(ios_instr_h_ * is);
-                SDL_Rect tr = {svx + (svw - iw) / 2, instr_y, iw, ih};
-                SDL_RenderCopy(sdl_renderer_, ios_instr_tex_, nullptr, &tr);
-                instr_y += ih + section_spacing;
-            }
-
-            if (android_icon_tex_ && android_instr_tex_) {
-                // Icon centered
-                SDL_Rect icr = {svx + (svw - icon_disp_sz) / 2, instr_y, icon_disp_sz, icon_disp_sz};
-                SDL_RenderCopy(sdl_renderer_, android_icon_tex_, nullptr, &icr);
-                instr_y += icon_disp_sz + icon_text_gap;
-                // Text centered below icon
-                float as = std::min(1.0f, svw * 0.85f / (float)android_instr_w_);
-                int aw = (int)(android_instr_w_ * as), ah = (int)(android_instr_h_ * as);
-                SDL_Rect tr = {svx + (svw - aw) / 2, instr_y, aw, ah};
-                SDL_RenderCopy(sdl_renderer_, android_instr_tex_, nullptr, &tr);
-            }
+            // Soft vertical gradient behind the whole screen area.
+            SDL_Color top = {18, 26, 50, 255}, bot = {7, 9, 18, 255};
+            float x0 = (float)svx, x1 = (float)(svx + svw);
+            float y0 = (float)svy, y1 = (float)(svy + svh);
+            SDL_Vertex v[4] = {
+                {{x0, y0}, top, {0, 0}}, {{x1, y0}, top, {0, 0}},
+                {{x0, y1}, bot, {0, 0}}, {{x1, y1}, bot, {0, 0}},
+            };
+            int idx[6] = {0, 1, 2, 2, 1, 3};
+            SDL_RenderGeometry(sdl_renderer_, nullptr, v, 4, idx, 6);
         }
+#ifdef _WIN32
+        {
+            const int u = std::min(svw, (int)(svh * 0.62f));   // layout unit
+            const int mcx = svx + svw / 2;
+            const int mark_r = std::max(16, (int)(u * 0.12f));
+            const int mcy = svy + (int)(svh * 0.17f);
+
+            // Phone mark with two slow pulse rings ("listening").
+            float ph = (SDL_GetTicks() % 2400) / 2400.0f;
+            for (int k = 0; k < 2; ++k) {
+                float p = std::fmod(ph + k * 0.5f, 1.0f);
+                int rr = mark_r + (int)(p * mark_r * 0.9f);
+                SDL_SetRenderDrawColor(sdl_renderer_, 59, 130, 246, (uint8_t)((1.0f - p) * 46));
+                fill_circle(sdl_renderer_, mcx, mcy, rr);
+            }
+            SDL_SetRenderDrawColor(sdl_renderer_, 37, 99, 235, 255);
+            fill_circle(sdl_renderer_, mcx, mcy, mark_r);
+            draw_glyph(sdl_renderer_, 0xE8EA, mcx, mcy, (int)(mark_r * 1.1f), 255, 255, 255, 255);
+
+            int ty = mcy + (int)(mark_r * 1.95f);
+            int th = draw_text_c(sdl_renderer_, "1PhoneMirror", (int)(u * 0.085f),
+                                 240, 243, 250, 255, mcx, ty, 1);
+            draw_text_c(sdl_renderer_, "Waiting for a phone to connect...", fit_text_px(
+                            sdl_renderer_, "Waiting for a phone to connect...", (int)(u * 0.045f),
+                            (int)(svw * 0.9f)),
+                        130, 144, 176, 255, mcx, ty + th + (int)(u * 0.01f), 1);
+
+            // Two "how to connect" cards.
+            const int card_w = (int)(svw * 0.88f);
+            const int card_x = svx + (svw - card_w) / 2;
+            const int card_h = (int)(u * 0.30f);
+            const int card_pad = (int)(u * 0.045f);
+            const int card_rad = (int)(u * 0.04f);
+            int card_y = svy + (int)(svh * 0.46f);
+
+            auto draw_card = [&](SDL_Texture* icon, const std::string& title,
+                                 const std::string& l1, const std::string& l2) {
+                SDL_SetRenderDrawColor(sdl_renderer_, 40, 52, 86, 255);
+                fill_round_rect(sdl_renderer_, card_x, card_y, card_w, card_h, card_rad);
+                SDL_SetRenderDrawColor(sdl_renderer_, 22, 30, 54, 255);
+                fill_round_rect(sdl_renderer_, card_x + 1, card_y + 1, card_w - 2,
+                                card_h - 2, card_rad - 1);
+
+                int tile_r = (int)(card_h * 0.30f);
+                int tcx = card_x + card_pad + tile_r;
+                int tcy = card_y + card_h / 2;
+                SDL_SetRenderDrawColor(sdl_renderer_, 34, 46, 80, 255);
+                fill_circle(sdl_renderer_, tcx, tcy, tile_r);
+                if (icon) {
+                    int isz = (int)(tile_r * 1.15f);
+                    SDL_SetTextureColorMod(icon, 205, 216, 240);
+                    SDL_Rect ir = {tcx - isz / 2, tcy - isz / 2, isz, isz};
+                    SDL_RenderCopy(sdl_renderer_, icon, nullptr, &ir);
+                    SDL_SetTextureColorMod(icon, 255, 255, 255);
+                }
+
+                int text_x = tcx + tile_r + card_pad;
+                int avail = card_x + card_w - card_pad - text_x;
+                int tpx = fit_text_px(sdl_renderer_, title, (int)(u * 0.062f), avail);
+                int p1 = fit_text_px(sdl_renderer_, l1, (int)(u * 0.040f), avail);
+                int p2 = fit_text_px(sdl_renderer_, l2, (int)(u * 0.040f), avail);
+                int block = (int)(tpx * 1.35f) + (int)(p1 * 1.35f) + (int)(p2 * 1.35f);
+                int y = card_y + (card_h - block) / 2;
+                y += draw_text_c(sdl_renderer_, title, tpx, 236, 240, 250, 255, text_x, y, 0);
+                y += draw_text_c(sdl_renderer_, l1, p1, 140, 152, 182, 255, text_x, y, 0);
+                draw_text_c(sdl_renderer_, l2, p2, 140, 152, 182, 255, text_x, y, 0);
+                card_y += card_h + (int)(u * 0.04f);
+            };
+            draw_card(android_icon_tex_, "Android",
+                      "Wi-Fi code, QR code or USB cable", "Press A to get started");
+            draw_card(ios_icon_tex_, "iPhone / iPad",
+                      "Control Center > Screen Mirroring", "then choose 1PhoneMirror");
+        }
+#endif
 
         // Footer with interactive segments
         draw_footer(svx, svy, svw, svh);
@@ -4605,9 +4704,12 @@ void Renderer::draw_island() {
     int icon_sz = btn_sz - 4;
     int icon_x = island_x + pad + 2;
     int icon_y = island_y + (row_h - icon_sz) / 2;
-    if (icon_texture_) {
-        SDL_Rect ir = {icon_x, icon_y, icon_sz, icon_sz};
-        SDL_RenderCopy(sdl_renderer_, icon_texture_, nullptr, &ir);
+    {
+        bool ih = in_rect(mx, my, icon_x, icon_y, icon_sz, icon_sz);
+        SDL_SetRenderDrawColor(sdl_renderer_, ih ? 59 : 37, ih ? 130 : 99, ih ? 246 : 235, 255);
+        fill_circle(sdl_renderer_, icon_x + icon_sz / 2, icon_y + icon_sz / 2, icon_sz / 2);
+        draw_glyph(sdl_renderer_, 0xE8EA, icon_x + icon_sz / 2, icon_y + icon_sz / 2,
+                   icon_sz * 6 / 10, 255, 255, 255, 255);
     }
     icon_btn_ = {icon_x, icon_y, icon_sz, icon_sz};
     bool icon_hover = in_rect(mx, my, icon_x, icon_y, icon_sz, icon_sz);
@@ -4626,51 +4728,8 @@ void Renderer::draw_island() {
         // Background pill — slightly transparent so it recedes into the island.
         SDL_SetRenderDrawColor(sdl_renderer_, gh ? 60 : 42, gh ? 60 : 42, gh ? 65 : 46, gh ? 160 : 110);
         fill_circle(sdl_renderer_, gear_x + gear_sz / 2, by_left + gear_sz / 2, gear_sz / 2);
-        // Cleaner gear icon: 8 trapezoidal teeth + ring + center hole.
-        int gcx = gear_x + gear_sz / 2, gcy = by_left + gear_sz / 2;
-        int r_outer = gear_sz * 9 / 20;   // tip of teeth
-        int r_inner = gear_sz * 7 / 20;   // base of teeth (= ring outer edge)
-        int r_ring  = gear_sz * 4 / 20;   // ring inner edge
-        int r_hole  = gear_sz * 2 / 20;   // center hole
-        const uint8_t bg_r = gh ? 60 : 42, bg_g = gh ? 60 : 42, bg_b = gh ? 65 : 46;
-        // Filled body of the gear: outer disk minus radial wedges between teeth.
-        for (int dy = -r_outer; dy <= r_outer; dy++) {
-            for (int dx = -r_outer; dx <= r_outer; dx++) {
-                int d2 = dx * dx + dy * dy;
-                if (d2 > r_outer * r_outer) continue;
-                float dist = std::sqrt((float)d2);
-                bool in_body;
-                if (dist <= r_inner) {
-                    in_body = true;
-                } else {
-                    // Outside the ring → only render where a tooth lives.
-                    // 8 teeth, each spans ~22 of the 45 degrees per slot.
-                    float ang = std::atan2((float)dy, (float)dx); // -PI..PI
-                    float slot = 6.28318f / 8.0f;                  // 45deg
-                    float local = std::fmod(ang + 6.28318f, slot); // 0..slot
-                    float half_tooth = slot * 0.28f;               // ~12.6deg each side of slot center
-                    float center_off = std::fabs(local - slot * 0.5f);
-                    in_body = (center_off <= half_tooth);
-                }
-                if (in_body) {
-                    // Dimmer fill so the gear reads as a secondary control.
-                    SDL_SetRenderDrawColor(sdl_renderer_, 200, 200, 205, gh ? 220 : 150);
-                    SDL_RenderDrawPoint(sdl_renderer_, gcx + dx, gcy + dy);
-                }
-            }
-        }
-        // Punch out the ring interior (between r_ring and r_hole stays solid white,
-        // inside r_hole is hollow — but we want a HOLE in the middle: so erase
-        // the inner ring area back to background, then erase the hole.
-        for (int dy = -r_ring; dy <= r_ring; dy++) {
-            for (int dx = -r_ring; dx <= r_ring; dx++) {
-                int d2 = dx * dx + dy * dy;
-                if (d2 <= r_ring * r_ring) {
-                    SDL_SetRenderDrawColor(sdl_renderer_, bg_r, bg_g, bg_b, gh ? 200 : 160);
-                    SDL_RenderDrawPoint(sdl_renderer_, gcx + dx, gcy + dy);
-                }
-            }
-        }
+        draw_glyph(sdl_renderer_, 0xE713, gear_x + gear_sz / 2, by_left + gear_sz / 2,
+                   gear_sz * 11 / 20, 215, 218, 228, gh ? 255 : 190);
         gear_hover = gh;
     }
 
@@ -4691,13 +4750,8 @@ void Renderer::draw_island() {
     bool close_hover = in_rect(mx, my, bx, by, btn_sz, btn_sz);
     SDL_SetRenderDrawColor(sdl_renderer_, close_hover ? 80 : 50, close_hover ? 30 : 30, close_hover ? 30 : 30, 180);
     fill_circle(sdl_renderer_, bx + btn_sz / 2, by + btn_sz / 2, btn_sz / 2);
-    int xr = btn_sz / 5;
-    int xcx = bx + btn_sz / 2, xcy = by + btn_sz / 2;
-    SDL_SetRenderDrawColor(sdl_renderer_, 255, 255, 255, close_hover ? 255 : 200);
-    for (int t = -1; t <= 1; t++) {
-        SDL_RenderDrawLine(sdl_renderer_, xcx - xr, xcy - xr + t, xcx + xr, xcy + xr + t);
-        SDL_RenderDrawLine(sdl_renderer_, xcx - xr, xcy + xr + t, xcx + xr, xcy - xr + t);
-    }
+    draw_glyph(sdl_renderer_, 0xE711, bx + btn_sz / 2, by + btn_sz / 2,
+               btn_sz * 11 / 22, 255, 255, 255, close_hover ? 255 : 210);
 
     // Folder button
     bx -= btn_sz + gap;
@@ -4705,13 +4759,8 @@ void Renderer::draw_island() {
     bool folder_hover = in_rect(mx, my, bx, by, btn_sz, btn_sz);
     SDL_SetRenderDrawColor(sdl_renderer_, folder_hover ? 70 : 50, folder_hover ? 70 : 50, folder_hover ? 75 : 55, 180);
     fill_circle(sdl_renderer_, bx + btn_sz / 2, by + btn_sz / 2, btn_sz / 2);
-    int fr = btn_sz / 4;
-    int fcx = bx + btn_sz / 2, fcy = by + btn_sz / 2;
-    SDL_SetRenderDrawColor(sdl_renderer_, 255, 255, 255, folder_hover ? 255 : 200);
-    SDL_Rect folder_body = {fcx - fr, fcy - fr + 2, fr * 2, (int)(fr * 1.5f)};
-    SDL_RenderDrawRect(sdl_renderer_, &folder_body);
-    SDL_Rect folder_tab = {fcx - fr, fcy - fr, fr, 2};
-    SDL_RenderFillRect(sdl_renderer_, &folder_tab);
+    draw_glyph(sdl_renderer_, 0xE8B7, bx + btn_sz / 2, by + btn_sz / 2,
+               btn_sz * 11 / 22, 255, 255, 255, folder_hover ? 255 : 210);
 
     // Record button (to the right of the photo button — sits between
     // folder and screenshot in the right-to-left cluster).
@@ -4732,32 +4781,15 @@ void Renderer::draw_island() {
     uint8_t rec_bg_b = rec_hover ? 35 : 35;
     SDL_SetRenderDrawColor(sdl_renderer_, rec_bg_r, rec_bg_g, rec_bg_b, 180);
     fill_circle(sdl_renderer_, bx + btn_sz / 2, by + btn_sz / 2, btn_sz / 2);
-    // Glyph: filled red circle when idle, red square when recording, red
-    // circle with thin ring when counting down.
-    int recr = btn_sz / 4;
-    int rcx = bx + btn_sz / 2, rcy = by + btn_sz / 2;
-    uint8_t rdot_a = rec_active ? 255 : (rec_hover ? 240 : 210);
-    if (rec_active) {
-        // Square indicator
-        int sq = recr;
-        SDL_Rect sqr = {rcx - sq, rcy - sq, sq * 2, sq * 2};
-        SDL_SetRenderDrawColor(sdl_renderer_, 235, 80, 80, rdot_a);
-        SDL_RenderFillRect(sdl_renderer_, &sqr);
-    } else {
-        SDL_SetRenderDrawColor(sdl_renderer_, 235, 80, 80, rdot_a);
-        fill_circle(sdl_renderer_, rcx, rcy, recr);
-        if (rec_count) {
-            // Thin white ring around the dot during countdown.
-            int ring = recr + 3;
-            SDL_SetRenderDrawColor(sdl_renderer_, 240, 240, 240, 220);
-            for (int dy = -ring; dy <= ring; dy++) {
-                for (int dx = -ring; dx <= ring; dx++) {
-                    int d2 = dx * dx + dy * dy;
-                    if (d2 <= ring * ring && d2 >= (ring - 1) * (ring - 1))
-                        SDL_RenderDrawPoint(sdl_renderer_, rcx + dx, rcy + dy);
-                }
-            }
-        }
+    {
+        int rcx = bx + btn_sz / 2, rcy = by + btn_sz / 2;
+        int gpx = btn_sz * 12 / 22;
+        if (rec_active)
+            draw_glyph(sdl_renderer_, 0xE71A, rcx, rcy, gpx, 255, 110, 110, 255);
+        else if (rec_count)
+            draw_glyph(sdl_renderer_, 0xECCA, rcx, rcy, gpx, 245, 245, 245, 235);
+        else
+            draw_glyph(sdl_renderer_, 0xECCB, rcx, rcy, gpx, 255, 100, 100, rec_hover ? 255 : 225);
     }
 
     // Screenshot button — filled white dot, mirroring the record button's
@@ -4768,11 +4800,10 @@ void Renderer::draw_island() {
     uint8_t ss_bg = flashing ? 200 : (ss_hover ? 70 : 50);
     SDL_SetRenderDrawColor(sdl_renderer_, ss_bg, ss_bg, ss_bg + 5, 180);
     fill_circle(sdl_renderer_, bx + btn_sz / 2, by + btn_sz / 2, btn_sz / 2);
-    int ssr = btn_sz / 4;
     int sscx = bx + btn_sz / 2, sscy = by + btn_sz / 2;
-    uint8_t ss_dot_a = flashing ? 255 : (ss_hover ? 255 : 220);
-    SDL_SetRenderDrawColor(sdl_renderer_, 240, 240, 240, ss_dot_a);
-    fill_circle(sdl_renderer_, sscx, sscy, ssr);
+    draw_glyph(sdl_renderer_, 0xE722, sscx, sscy, btn_sz * 12 / 22,
+               flashing ? 20 : 245, flashing ? 20 : 245, flashing ? 20 : 250,
+               ss_hover || flashing ? 255 : 225);
 
     // Settings (gear) button is now drawn next to the icon on the LEFT side
     // (see block above). The right-cluster ends here with the screenshot button.
@@ -4860,84 +4891,28 @@ void Renderer::draw_island() {
 }
 
 void Renderer::draw_footer(int svx, int svy, int svw, int svh) {
-    if (footer_line1_.empty()) return;
-
     footer_hits_.clear();
+    if (footer_line3_.empty()) return;
 
-    // Scale factor: textures rendered at 40px GDI font for crispness,
-    // scale down to desired display size relative to screen width.
-    // Target: ~13px equivalent at svw=300.
+    // Just the version, centred at the bottom of the screen (click opens the
+    // version history). Textures are baked at a 40px font and scaled down.
     float sf = std::max(0.3f, svw / 300.0f) * (13.0f / 40.0f);
-    sf = std::min(sf, 0.6f);
-
-    auto line_w = [&](const std::vector<FooterSeg>& line, float scale) {
-        int total = 0;
-        for (auto& s : line) total += (int)(s.w * scale);
-        return total;
-    };
-
-    // All three footer lines render at the same (slightly smaller) size
-    // so MSEndpointMgr matches Simon visually.
-    float sf2 = sf * 0.85f;
-
-    int total_w1 = line_w(footer_line1_, sf2);
-    int total_w2 = line_w(footer_line2_, sf2);
-    int total_w3 = line_w(footer_line3_, sf2);
-    int line_h  = footer_line1_.empty() ? 0 : (int)(footer_line1_[0].h * sf2);
-    int line_h2 = footer_line2_.empty() ? 0 : (int)(footer_line2_[0].h * sf2);
-    int line_h3 = footer_line3_.empty() ? 0 : (int)(footer_line3_[0].h * sf2);
-    int gap = std::max(2, line_h / 4);
-
-    // Position near bottom of screen area
-    int footer_y = svy + svh - line_h - line_h2
-                 - (line_h3 > 0 ? (gap + line_h3) : 0)
-                 - gap - std::max(6, svh / 25);
-
-    // Footer background band — distinct from waiting screen.
-    {
-        int pad_top = std::max(4, line_h / 3);
-        int band_y = footer_y - pad_top;
-        int band_h = (svy + svh) - band_y;
-        SDL_SetRenderDrawColor(sdl_renderer_, 16, 18, 24, 255);
-        SDL_Rect band = {svx, band_y, svw, band_h};
-        SDL_RenderFillRect(sdl_renderer_, &band);
-    }
-
-    // Line 1
-    int x1 = svx + (svw - total_w1) / 2;
-    for (auto& s : footer_line1_) {
-        int sw = (int)(s.w * sf2), sh = (int)(s.h * sf2);
-        SDL_Rect dst = {x1, footer_y, sw, sh};
-        if (s.tex) SDL_RenderCopy(sdl_renderer_, s.tex, nullptr, &dst);
-        if (!s.url.empty() || !s.tooltip.empty())
-            footer_hits_.push_back({x1, footer_y, sw, sh, s.url, s.tooltip});
-        x1 += sw;
-    }
-
-    // Line 2
-    int y2 = footer_y + line_h + gap;
-    int x2 = svx + (svw - total_w2) / 2;
-    for (auto& s : footer_line2_) {
-        int sw = (int)(s.w * sf2), sh = (int)(s.h * sf2);
-        SDL_Rect dst = {x2, y2, sw, sh};
-        if (s.tex) SDL_RenderCopy(sdl_renderer_, s.tex, nullptr, &dst);
-        if (!s.url.empty() || !s.tooltip.empty())
-            footer_hits_.push_back({x2, y2, sw, sh, s.url, s.tooltip});
-        x2 += sw;
-    }
-
-    // Line 3 (version on its own line)
-    if (!footer_line3_.empty()) {
-        int y3 = y2 + line_h2 + gap;
-        int x3 = svx + (svw - total_w3) / 2;
-        for (auto& s : footer_line3_) {
-            int sw = (int)(s.w * sf2), sh = (int)(s.h * sf2);
-            SDL_Rect dst = {x3, y3, sw, sh};
-            if (s.tex) SDL_RenderCopy(sdl_renderer_, s.tex, nullptr, &dst);
-            if (!s.url.empty() || !s.tooltip.empty())
-                footer_hits_.push_back({x3, y3, sw, sh, s.url, s.tooltip});
-            x3 += sw;
+    sf = std::min(sf, 0.6f) * 0.9f;
+    int total_w = 0;
+    for (auto& s : footer_line3_) total_w += (int)(s.w * sf);
+    int line_h = (int)(footer_line3_[0].h * sf);
+    int fy = svy + svh - line_h - std::max(10, svh / 28);
+    int fx = svx + (svw - total_w) / 2;
+    for (auto& s : footer_line3_) {
+        int sw = (int)(s.w * sf), sh = (int)(s.h * sf);
+        SDL_Rect dst = {fx, fy, sw, sh};
+        if (s.tex) {
+            SDL_SetTextureColorMod(s.tex, 100, 112, 140);
+            SDL_RenderCopy(sdl_renderer_, s.tex, nullptr, &dst);
         }
+        if (!s.url.empty() || !s.tooltip.empty())
+            footer_hits_.push_back({fx, fy, sw, sh, s.url, s.tooltip});
+        fx += sw;
     }
 
     // Hover tooltip for footer segments
@@ -6560,6 +6535,7 @@ void Renderer::draw_android_qr(int svx, int svy, int svw, int svh) {
     android_help_btn_ = {};
     android_close_btn_ = {};
     android_qr_btn_ = {};
+    android_usb_btn_ = {};
     for (auto& r : android_field_rects_) r = {};
     android_discover_btns_.clear();
 
@@ -6710,6 +6686,37 @@ void Renderer::draw_android_qr(int svx, int svy, int svw, int svh) {
             SDL_DestroyTexture(tex);
         }
     }
+}
+
+void Renderer::android_usb_start() {
+    if (!android_usb_fn_) {
+        std::lock_guard lk(android_status_mutex_);
+        android_status_ = "USB handler not wired.";
+        android_status_is_error_ = true;
+        return;
+    }
+    {
+        std::lock_guard lk(android_status_mutex_);
+        android_status_ = "Looking for a phone on USB...";
+        android_status_is_error_ = false;
+        android_busy_ = true;
+    }
+    auto fn = android_usb_fn_;
+    std::thread([this, fn]() {
+        std::string r = fn();
+        bool err = (r.rfind("Mirroring ", 0) != 0);
+        if (err) std::cerr << "[Android] " << r << "\n";
+        else     std::cout << "[Android] " << r << "\n";
+        std::lock_guard lk(android_status_mutex_);
+        android_status_ = r;
+        android_status_is_error_ = err;
+        android_busy_ = false;
+        if (!err) {
+            android_panel_visible_ = false;
+            android_panel_animating_ = true;
+            android_panel_anim_start_ = std::chrono::steady_clock::now();
+        }
+    }).detach();
 }
 
 void Renderer::android_submit() {
@@ -7194,7 +7201,8 @@ void Renderer::draw_android_panel() {
 
     // Buttons
     int bw = (panel_w - pad*2 - gap) / 2;
-    android_qr_btn_         = {panel_x + pad, cy, panel_w - pad*2, btn_h};
+    android_qr_btn_         = {panel_x + pad, cy, bw, btn_h};
+    android_usb_btn_        = {panel_x + pad + bw + gap, cy, bw, btn_h};
     cy += btn_h + gap;
     android_connect_btn_    = {panel_x + pad,           cy, bw, btn_h};
     android_disconnect_btn_ = {panel_x + pad + bw + gap, cy, bw, btn_h};
@@ -7217,7 +7225,8 @@ void Renderer::draw_android_panel() {
             SDL_DestroyTexture(tex);
         }
     };
-    draw_btn(android_qr_btn_,         "Pair with QR code", false);
+    draw_btn(android_qr_btn_,         "QR code", false);
+    draw_btn(android_usb_btn_,        "USB cable", false);
     draw_btn(android_connect_btn_,    android_busy_ ? "Working..." : "Connect", true);
     draw_btn(android_disconnect_btn_, "Disconnect", false);
 }
@@ -7261,6 +7270,12 @@ void Renderer::draw_android_help() {
         {Kind::TEXT,    "", "This panel scans the network for phones with Wireless debugging on. Discovered phones appear in the 'Discovered devices' list at the top."},
         {Kind::TEXT,    "", "Tip: if your phone is not showing up, toggle Wireless debugging off and on again on the phone. It will then re-advertise its service and pop up in the list within a second."},
         {Kind::TEXT,    "", "Click a discovered device to fill in IP address and Connect port automatically. Then open 'Pair device with pairing code' on the phone, type the Pair port and 6-digit Pairing code shown there, and press Connect."},
+
+        {Kind::HEADING, "", "QR code (no typing)"},
+        {Kind::TEXT,    "", "Press 'QR code', then on the phone open Wireless debugging > 'Pair device with QR code' and scan the code shown here. The phone pairs and connects by itself."},
+
+        {Kind::HEADING, "", "USB cable"},
+        {Kind::TEXT,    "", "Turn on 'USB debugging' in Developer options, plug the phone in, press 'USB cable' and allow 'USB debugging' on the phone the first time. No Wi-Fi needed."},
 
         {Kind::HEADING, "", "Reading the values manually"},
         {Kind::TEXT,    "*", "IP address: First part of 'IP address & Port' on the main Wireless debugging screen (e.g. 192.168.10.73)."},

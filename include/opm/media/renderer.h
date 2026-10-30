@@ -123,6 +123,11 @@ public:
         std::function<bool()> cancelled)>;
     void set_android_qr_handler(AndroidQrFn fn) { android_qr_fn_ = std::move(fn); }
 
+    // USB-cable mode: the handler looks for a phone on USB and starts
+    // mirroring it; returns "Mirroring <serial>" or an explanation.
+    using AndroidUsbFn = std::function<std::string()>;
+    void set_android_usb_handler(AndroidUsbFn fn) { android_usb_fn_ = std::move(fn); }
+
     void show_android_panel(); // open from outside if you want
 
 private:
@@ -762,6 +767,9 @@ private:
     BtnRect android_qr_btn_;                   // "Pair with QR code" on the form
     BtnRect android_qr_cancel_btn_;            // "Cancel" in QR mode
     void android_qr_start();
+    AndroidUsbFn android_usb_fn_;
+    BtnRect android_usb_btn_;                  // "USB cable" on the form
+    void android_usb_start();
     void android_qr_stop();
     void draw_android_qr(int svx, int svy, int svw, int svh);
 

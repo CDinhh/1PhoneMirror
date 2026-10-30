@@ -31,7 +31,7 @@ public:
     ~App();
 
     struct Config {
-        std::string name = "1PhoneMirror by MSEndpointMgr";
+        std::string name = "1PhoneMirror";
         int window_width = 1280;
         int window_height = 720;
         bool enable_airplay = true;
@@ -67,6 +67,11 @@ public:
                                          const std::string& pair_port,
                                          const std::string& pin,
                                          const std::string& connect_port = "");
+    // Mirror a phone plugged in with a USB cable (USB debugging on). Picks
+    // the first USB device that is not already mirrored. Returns
+    // "Mirroring <serial>" on success, otherwise a human-readable reason.
+    std::string android_connect_usb();
+
     // QR-code pairing (Wireless debugging -> "Pair device with QR code").
     // The caller shows a QR encoding `WIFI:T:ADB;S:<name>;P:<password>;;`.
     // Once the phone scans it, it advertises an `_adb-tls-pairing._tcp`

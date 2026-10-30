@@ -366,6 +366,7 @@ bool App::init(const Config& config) {
                 std::thread([this]() { android_disconnect(); }).detach();
             });
 
+        renderer_.set_android_usb_handler([this]() { return android_connect_usb(); });
         renderer_.set_android_qr_handler(
             [this](const std::string& name, const std::string& password,
                    std::function<bool()> cancelled) {

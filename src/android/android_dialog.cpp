@@ -320,6 +320,57 @@ std::string App::android_pair_via_qr(const std::string& name,
     return android_finish_connect_(ip, pair_addr);
 }
 
+std::string App::android_connect_usb() {
+    if (android_jar_path_.empty())
+        return "scrcpy-server.jar not found in tools/";
+
+    // USB serials are plain (e.g. "fc7639210013"); wireless ones are
+    // "ip:port" or an mDNS name ("adb-..."), emulators are "emulator-...".
+    auto is_usb = [](const std::string& s) {
+        return s.find(':') == std::string::npos &&
+               s.rfind("adb-", 0) != 0 &&
+               s.rfind("emulator-", 0) != 0;
+    };
+
+    std::vector<android::DeviceInfo> usb;
+    // The adb server may need a moment to notice a freshly plugged phone.
+    for (int i = 0; i < 6; ++i) {
+        usb.clear();
+        for (auto& d : adb_.list_devices())
+            if (is_usb(d.serial)) usb.push_back(d);
+        if (!usb.empty()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    if (usb.empty())
+        return "No USB phone found. Plug in the cable, turn on USB debugging "
+               "(Developer options) and set the USB mode to File transfer.";
+
+    std::string last_problem;
+    for (auto& d : usb) {
+        if (d.state == "unauthorized") {
+            last_problem = "The phone is waiting for approval: unlock it and tap "
+                           "Allow on the 'Allow USB debugging?' prompt, then try again.";
+            continue;
+        }
+        if (d.state != "device") {
+            last_problem = "The phone is '" + d.state + "'. Re-plug the cable and try again.";
+            continue;
+        }
+        bool running = false;
+        {
+            std::lock_guard lk(scrcpy_mutex_);
+            for (auto& s : scrcpy_sessions_)
+                if (s && s->serial == d.serial) { running = true; break; }
+        }
+        if (running) { last_problem = "That phone is already being mirrored."; continue; }
+
+        std::string err;
+        if (!start_android_session_(d.serial, &err)) return err;
+        return "Mirroring " + d.serial;
+    }
+    return last_problem.empty() ? "No usable USB phone found." : last_problem;
+}
+
 void App::android_disconnect(const std::string& serial) {
     std::vector<std::unique_ptr<AndroidSession>> stopped;
     {
