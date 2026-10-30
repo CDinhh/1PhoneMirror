@@ -113,6 +113,16 @@ public:
         android_discover_fn_ = std::move(fn);
     }
 
+    // QR-code pairing. The renderer generates a random service name and
+    // password, shows the QR (`WIFI:T:ADB;S:<name>;P:<pw>;;`) and calls this
+    // handler on a worker thread; the handler blocks until the phone has
+    // scanned + paired (or `cancelled()` turns true) and returns a status
+    // string — "Mirroring <serial>" on success.
+    using AndroidQrFn = std::function<std::string(
+        const std::string& name, const std::string& password,
+        std::function<bool()> cancelled)>;
+    void set_android_qr_handler(AndroidQrFn fn) { android_qr_fn_ = std::move(fn); }
+
     void show_android_panel(); // open from outside if you want
 
 private:
@@ -742,6 +752,18 @@ private:
     void draw_android_panel();
     void draw_android_help();
     void android_submit();
+
+    // QR pairing mode of the connect panel.
+    AndroidQrFn android_qr_fn_;
+    std::atomic<bool> android_qr_active_{false};
+    std::shared_ptr<std::atomic<bool>> android_qr_cancel_;
+    int android_qr_size_ = 0;                  // modules per side
+    std::vector<uint8_t> android_qr_modules_;  // size*size, 1 = dark
+    BtnRect android_qr_btn_;                   // "Pair with QR code" on the form
+    BtnRect android_qr_cancel_btn_;            // "Cancel" in QR mode
+    void android_qr_start();
+    void android_qr_stop();
+    void draw_android_qr(int svx, int svy, int svw, int svh);
 
     // Background mDNS discovery for the connect panel.
     AndroidDiscoverFn android_discover_fn_;

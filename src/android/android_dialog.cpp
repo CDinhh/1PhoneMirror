@@ -122,27 +122,7 @@ std::string App::android_pair_and_connect(const std::string& ip,
     if (ip.empty() || pair_port.empty() || pin.size() != 6)
         return "Fill IP, port and 6-digit PIN.";
 
-    // If a session for this exact IP is already running, tear just that
-    // one down. We intentionally do NOT touch other sessions or call
-    // `adb disconnect` (no-arg) — that would knock every other connected
-    // phone offline.
-    {
-        std::lock_guard lk(scrcpy_mutex_);
-        for (auto& s : scrcpy_sessions_) {
-            if (s && s->serial.rfind(ip + ":", 0) == 0 && s->receiver) {
-                std::cout << "[App] Replacing existing Android session for "
-                          << s->serial << "\n";
-                s->receiver->stop();
-                adb_.disconnect(s->serial);
-            }
-        }
-        scrcpy_sessions_.erase(
-            std::remove_if(scrcpy_sessions_.begin(), scrcpy_sessions_.end(),
-                [&](const std::unique_ptr<AndroidSession>& s) {
-                    return s && s->serial.rfind(ip + ":", 0) == 0;
-                }),
-            scrcpy_sessions_.end());
-    }
+    android_drop_sessions_for_ip_(ip);
 
     std::string pair_addr = ip + ":" + pair_port;
     std::string msg;
@@ -174,6 +154,35 @@ std::string App::android_pair_and_connect(const std::string& ip,
                "and that the phone is on the same Wi-Fi.";
     }
 
+    return android_finish_connect_(ip, pair_addr);
+}
+
+void App::android_drop_sessions_for_ip_(const std::string& ip) {
+    // If a session for this exact IP is already running, tear just that
+    // one down. We intentionally do NOT touch other sessions or call
+    // `adb disconnect` (no-arg) — that would knock every other connected
+    // phone offline.
+    {
+        std::lock_guard lk(scrcpy_mutex_);
+        for (auto& s : scrcpy_sessions_) {
+            if (s && s->serial.rfind(ip + ":", 0) == 0 && s->receiver) {
+                std::cout << "[App] Replacing existing Android session for "
+                          << s->serial << "\n";
+                s->receiver->stop();
+                adb_.disconnect(s->serial);
+            }
+        }
+        scrcpy_sessions_.erase(
+            std::remove_if(scrcpy_sessions_.begin(), scrcpy_sessions_.end(),
+                [&](const std::unique_ptr<AndroidSession>& s) {
+                    return s && s->serial.rfind(ip + ":", 0) == 0;
+                }),
+            scrcpy_sessions_.end());
+    }
+}
+
+std::string App::android_finish_connect_(const std::string& ip,
+                                         const std::string& pair_addr) {
     // Log adb's self-report on its mDNS subsystem so failures are
     // immediately diagnosable from the in-app log.
     {
@@ -264,6 +273,51 @@ std::string App::android_pair_and_connect(const std::string& ip,
         return err;
 
     return "Mirroring " + serial;
+}
+
+std::string App::android_pair_via_qr(const std::string& name,
+                                     const std::string& password,
+                                     std::function<bool()> cancelled) {
+    if (android_jar_path_.empty())
+        return "scrcpy-server.jar not found in tools/";
+
+    // 1. Wait for the phone to scan the QR. It then advertises
+    //    _adb-tls-pairing._tcp with instance name == `name`.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
+    std::string pair_addr;
+    while (pair_addr.empty()) {
+        if (cancelled && cancelled()) return "QR pairing cancelled.";
+        if (std::chrono::steady_clock::now() > deadline)
+            return "Timed out waiting for the phone to scan the QR code.";
+        for (auto& s : adb_.mdns_services()) {
+            if (s.type.find("_adb-tls-pairing") == std::string::npos) continue;
+            if (s.name != name) continue;
+            pair_addr = s.ip_port;
+            break;
+        }
+        if (pair_addr.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    std::cout << "[App] Android QR scanned, pairing service at " << pair_addr << "\n";
+
+    auto colon = pair_addr.rfind(':');
+    std::string ip = colon == std::string::npos ? pair_addr : pair_addr.substr(0, colon);
+    android_drop_sessions_for_ip_(ip);
+
+    // 2. Pair with the QR password (retry: the service can appear a moment
+    //    before the phone accepts connections).
+    std::string msg;
+    bool paired = false;
+    for (int attempt = 0; attempt < 3 && !paired; ++attempt) {
+        if (cancelled && cancelled()) return "QR pairing cancelled.";
+        paired = adb_.pair(pair_addr, password, &msg);
+        if (!paired) std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    }
+    if (!paired) return "Pair failed: " + msg;
+    std::cout << "[App] Android paired via QR: " << pair_addr << "\n";
+
+    // 3. Connect + mirror.
+    return android_finish_connect_(ip, pair_addr);
 }
 
 void App::android_disconnect(const std::string& serial) {

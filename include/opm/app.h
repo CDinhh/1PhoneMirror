@@ -67,6 +67,16 @@ public:
                                          const std::string& pair_port,
                                          const std::string& pin,
                                          const std::string& connect_port = "");
+    // QR-code pairing (Wireless debugging -> "Pair device with QR code").
+    // The caller shows a QR encoding `WIFI:T:ADB;S:<name>;P:<password>;;`.
+    // Once the phone scans it, it advertises an `_adb-tls-pairing._tcp`
+    // mDNS service whose instance name is `name`; we `adb pair` to it with
+    // `password`, then connect and start mirroring. Blocks (poll every
+    // 500 ms, 3 min max) until paired, cancelled or timed out. Run it on a
+    // worker thread. Returns "Mirroring <serial>" on success.
+    std::string android_pair_via_qr(const std::string& name,
+                                    const std::string& password,
+                                    std::function<bool()> cancelled);
     // Disconnect a single Android session by serial ("ip:port"), or all
     // sessions if `serial` is empty.
     void android_disconnect(const std::string& serial = {});
@@ -129,6 +139,12 @@ private:
     // Implemented in src/android/android_dialog.cpp.
     bool start_android_session_(const std::string& serial,
                                 std::string* out_error);
+    // After a successful `adb pair`: find the phone's connect endpoint via
+    // mDNS / `adb devices`, connect and start mirroring.
+    std::string android_finish_connect_(const std::string& ip,
+                                        const std::string& pair_addr);
+    // Tear down any running session whose serial starts with `ip + ":"`.
+    void android_drop_sessions_for_ip_(const std::string& ip);
 #endif
 
     std::atomic<bool> running_{false};

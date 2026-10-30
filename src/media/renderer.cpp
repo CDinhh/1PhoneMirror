@@ -5,6 +5,7 @@
 #include <opm/usage_log.h>
 #ifdef _WIN32
 #include <opm/media/ocr.h>
+#include <qrcodegen/qrcodegen.hpp>
 #endif
 #include <algorithm>
 #include <chrono>
@@ -14,6 +15,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -1276,6 +1279,10 @@ void Renderer::run() {
                               :  android_focus_ == 1 ? android_connect_port_
                               :  android_focus_ == 2 ? android_port_
                               :                        android_pin_);
+                    if (android_qr_active_.load()) {
+                        if (event.key.keysym.sym == SDLK_ESCAPE) android_qr_stop();
+                        break;
+                    }
                     if (event.key.keysym.sym == SDLK_BACKSPACE) {
                         if (!fld.empty()) fld.pop_back();
                         break;
@@ -1560,6 +1567,18 @@ void Renderer::run() {
                         // event continue so e.g. the title-bar close button
                         // can still receive it.
                         android_help_visible_ = false;
+                    }
+                    if (android_qr_active_.load()) {
+                        if (in(android_qr_cancel_btn_)) { android_qr_stop(); break; }
+                        // Clicks inside the QR panel are swallowed; a click
+                        // outside cancels and falls through to close the panel.
+                        if (in_rect(mx, my, android_panel_rect_.x, android_panel_rect_.y,
+                                    android_panel_rect_.w, android_panel_rect_.h)) break;
+                        android_qr_stop();
+                    }
+                    if (in(android_qr_btn_) && !android_busy_) {
+                        android_qr_start();
+                        break;
                     }
                     if (in(android_close_btn_)) {
                         android_panel_visible_ = false;
@@ -6338,6 +6357,8 @@ void Renderer::show_android_panel() {
     // them between panel opens within a single app session.
     android_port_.clear();
     android_pin_.clear();
+    if (android_qr_cancel_) android_qr_cancel_->store(true);
+    android_qr_active_.store(false);
 #ifdef _WIN32
     if (android_ip_.empty()) {
         std::string pfx = local_subnet_prefix();
@@ -6450,6 +6471,247 @@ bool valid_ipv4(const std::string& s) {
 }
 }
 
+void Renderer::android_qr_stop() {
+    if (android_qr_cancel_) android_qr_cancel_->store(true);
+    if (android_qr_active_.exchange(false)) {
+        std::lock_guard lk(android_status_mutex_);
+        android_status_ = "QR pairing cancelled.";
+        android_status_is_error_ = false;
+    }
+}
+
+void Renderer::android_qr_start() {
+    auto fail = [&](const std::string& m) {
+        std::lock_guard lk(android_status_mutex_);
+        android_status_ = m;
+        android_status_is_error_ = true;
+    };
+    if (!android_qr_fn_) return fail("QR pairing handler not wired.");
+
+    // Same shape Android Studio uses: S:studio-<10 chars>, P:<12 chars>.
+    static const char kAlnum[] =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    std::random_device rd;
+    std::uniform_int_distribution<int> pick(0, (int)sizeof(kAlnum) - 2);
+    auto rnd = [&](int n) {
+        std::string s;
+        for (int i = 0; i < n; ++i) s.push_back(kAlnum[pick(rd)]);
+        return s;
+    };
+    std::string name = "studio-" + rnd(10);
+    std::string password = rnd(12);
+    std::string payload = "WIFI:T:ADB;S:" + name + ";P:" + password + ";;";
+
+    try {
+        auto qr = qrcodegen::QrCode::encodeText(payload.c_str(),
+                                                qrcodegen::QrCode::Ecc::MEDIUM);
+        android_qr_size_ = qr.getSize();
+        android_qr_modules_.assign((size_t)android_qr_size_ * android_qr_size_, 0);
+        for (int y = 0; y < android_qr_size_; ++y)
+            for (int x = 0; x < android_qr_size_; ++x)
+                android_qr_modules_[(size_t)y * android_qr_size_ + x] =
+                    qr.getModule(x, y) ? 1 : 0;
+    } catch (const std::exception& e) {
+        return fail(std::string("QR generation failed: ") + e.what());
+    }
+
+    if (android_qr_cancel_) android_qr_cancel_->store(true);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    android_qr_cancel_ = cancel;
+    {
+        std::lock_guard lk(android_status_mutex_);
+        android_status_ = "Waiting for the phone to scan the code...";
+        android_status_is_error_ = false;
+    }
+    android_qr_active_.store(true);
+
+    auto fn = android_qr_fn_;
+    std::thread([this, fn, name, password, cancel]() {
+        std::string r = fn(name, password, [cancel]() { return cancel->load(); });
+        if (cancel->load()) return;   // cancelled / superseded: stay silent
+        bool err = (r.rfind("Mirroring ", 0) != 0);
+        if (err) std::cerr << "[Android] " << r << "\n";
+        else     std::cout << "[Android] " << r << "\n";
+        std::lock_guard lk(android_status_mutex_);
+        android_status_ = r;
+        android_status_is_error_ = err;
+        android_qr_active_.store(false);
+        if (!err) {
+            android_panel_visible_ = false;
+            android_panel_animating_ = true;
+            android_panel_anim_start_ = std::chrono::steady_clock::now();
+        }
+    }).detach();
+}
+
+void Renderer::draw_android_qr(int svx, int svy, int svw, int svh) {
+    int uw = ui_ref_width();
+    int panel_w = std::min((int)(svw * 0.85f), (int)(uw * 1.6f));
+    int pad     = std::max(10, panel_w / 22);
+    int label_h = std::max(14, panel_w / 26);
+    int btn_h   = std::max(28, panel_w / 11);
+    int gap     = std::max(6, pad / 2);
+    int title_h = std::max(20, panel_w / 16);
+
+    // Other panel controls are not on screen in this mode: clear their hit
+    // rects so stale ones can't be clicked.
+    android_connect_btn_ = {};
+    android_disconnect_btn_ = {};
+    android_help_btn_ = {};
+    android_close_btn_ = {};
+    android_qr_btn_ = {};
+    for (auto& r : android_field_rects_) r = {};
+    android_discover_btns_.clear();
+
+    const int quiet = 2;   // quiet-zone modules around the code
+    int qn = android_qr_size_;
+    int max_box = std::min(panel_w - pad * 2, (int)(svh * 0.46f));
+    int ms  = qn > 0 ? std::max(1, max_box / (qn + quiet * 2)) : 1;
+    int box = qn > 0 ? ms * (qn + quiet * 2) : 0;
+
+    auto wrap = [&](const std::string& s) {
+        std::vector<std::string> lines;
+        int max_w = panel_w - pad * 2;
+        std::vector<std::string> words;
+        std::string cur;
+        for (char ch : s) {
+            if (ch == ' ' || ch == '\n') {
+                if (!cur.empty()) { words.push_back(cur); cur.clear(); }
+            } else cur.push_back(ch);
+        }
+        if (!cur.empty()) words.push_back(cur);
+        std::string line;
+        for (auto& w : words) {
+            std::string trial = line.empty() ? w : line + " " + w;
+            int tw = 0, th = 0;
+            SDL_Texture* probe = make_text_texture(sdl_renderer_, trial,
+                                                   label_h, 200, 200, 200, &tw, &th);
+            if (probe) SDL_DestroyTexture(probe);
+            if (tw <= max_w || line.empty()) line = trial;
+            else { lines.push_back(line); line = w; }
+        }
+        if (!line.empty()) lines.push_back(line);
+        return lines;
+    };
+
+    std::string status;
+    bool status_err = false;
+    {
+        std::lock_guard lk(android_status_mutex_);
+        status = android_status_;
+        status_err = android_status_is_error_;
+    }
+    auto instr_lines = wrap("On the phone: Developer options > Wireless debugging > "
+                            "Pair device with QR code, then scan this code.");
+    auto status_lines = wrap(status);
+    int status_rows = std::max<int>(1, (int)status_lines.size());
+
+    int btn_bottom_pad = std::max(10, pad);
+    int total_h = pad + title_h + gap * 2
+                + box + gap
+                + label_h * (int)instr_lines.size() + gap
+                + label_h * status_rows + gap
+                + btn_h + pad + btn_bottom_pad;
+
+    int panel_x = svx + (svw - panel_w) / 2;
+    int bottom_margin = std::max(8, svh / 28);
+    int panel_y = svy + (svh - total_h) / 2 + svh / 18;
+    if (panel_y + total_h > svy + svh - bottom_margin)
+        panel_y = svy + svh - total_h - bottom_margin;
+    if (panel_y < svy + 4) panel_y = svy + 4;
+    panel_y -= (int)((1.0f - android_panel_anim_) * 30);
+    uint8_t alpha      = (uint8_t)(245 * android_panel_anim_);
+    uint8_t text_alpha = (uint8_t)(255 * android_panel_anim_);
+    uint8_t qr_alpha   = (uint8_t)(255 * android_panel_anim_);
+
+    android_panel_rect_ = {panel_x, panel_y, panel_w, total_h};
+
+    int pr = std::max(8, pad / 2);
+    SDL_SetRenderDrawColor(sdl_renderer_, 30, 30, 34, alpha);
+    SDL_Rect body = {panel_x + pr, panel_y, panel_w - pr * 2, total_h};
+    SDL_RenderFillRect(sdl_renderer_, &body);
+    SDL_Rect ls = {panel_x, panel_y + pr, pr, total_h - pr * 2};
+    SDL_RenderFillRect(sdl_renderer_, &ls);
+    SDL_Rect rs = {panel_x + panel_w - pr, panel_y + pr, pr, total_h - pr * 2};
+    SDL_RenderFillRect(sdl_renderer_, &rs);
+    fill_circle(sdl_renderer_, panel_x + pr, panel_y + pr, pr);
+    fill_circle(sdl_renderer_, panel_x + panel_w - pr, panel_y + pr, pr);
+    fill_circle(sdl_renderer_, panel_x + pr, panel_y + total_h - pr, pr);
+    fill_circle(sdl_renderer_, panel_x + panel_w - pr, panel_y + total_h - pr, pr);
+
+    auto draw_text = [&](const std::string& s, int size, uint8_t r, uint8_t g,
+                         uint8_t b, int x, int y, int max_w, bool center) {
+        int tw = 0, th = 0;
+        SDL_Texture* tex = make_text_texture(sdl_renderer_, s, size, r, g, b, &tw, &th);
+        if (!tex) return th > 0 ? th : size;
+        int dw = std::min(tw, max_w);
+        int dx = center ? x + (max_w - dw) / 2 : x;
+        SDL_Rect d = {dx, y, dw, th};
+        SDL_SetTextureAlphaMod(tex, text_alpha);
+        SDL_RenderCopy(sdl_renderer_, tex, nullptr, &d);
+        SDL_DestroyTexture(tex);
+        return th;
+    };
+
+    int cy = panel_y + pad;
+    draw_text("Pair with QR code", title_h, 235, 235, 240,
+              panel_x + pad, cy, panel_w - pad * 2, true);
+    cy += title_h + gap * 2;
+
+    // QR code: white plate (with quiet zone) + dark modules.
+    if (qn > 0) {
+        int bx = panel_x + (panel_w - box) / 2;
+        SDL_SetRenderDrawColor(sdl_renderer_, 255, 255, 255, qr_alpha);
+        SDL_Rect plate = {bx, cy, box, box};
+        SDL_RenderFillRect(sdl_renderer_, &plate);
+        SDL_SetRenderDrawColor(sdl_renderer_, 0, 0, 0, qr_alpha);
+        for (int y = 0; y < qn; ++y)
+            for (int x = 0; x < qn; ++x)
+                if (android_qr_modules_[(size_t)y * qn + x]) {
+                    SDL_Rect m = {bx + (x + quiet) * ms, cy + (y + quiet) * ms, ms, ms};
+                    SDL_RenderFillRect(sdl_renderer_, &m);
+                }
+    }
+    cy += box + gap;
+
+    for (auto& ln : instr_lines) {
+        draw_text(ln, label_h, 170, 170, 180, panel_x + pad, cy, panel_w - pad * 2, false);
+        cy += label_h;
+    }
+    cy += gap;
+
+    {
+        uint8_t cr = status_err ? 230 : 140;
+        uint8_t cg = status_err ? 110 : 200;
+        uint8_t cb = status_err ? 110 : 140;
+        for (auto& ln : status_lines) {
+            draw_text(ln, label_h, cr, cg, cb, panel_x + pad, cy, panel_w - pad * 2, false);
+            cy += label_h;
+        }
+        if (status_lines.empty()) cy += label_h;
+        cy += gap;
+    }
+
+    android_qr_cancel_btn_ = {panel_x + pad, cy, panel_w - pad * 2, btn_h};
+    {
+        const BtnRect& r = android_qr_cancel_btn_;
+        SDL_SetRenderDrawColor(sdl_renderer_, 50, 50, 55, alpha);
+        SDL_Rect br = {r.x, r.y, r.w, r.h};
+        SDL_RenderFillRect(sdl_renderer_, &br);
+        SDL_SetRenderDrawColor(sdl_renderer_, 90, 90, 100, alpha);
+        SDL_RenderDrawRect(sdl_renderer_, &br);
+        int tw = 0, th = 0;
+        SDL_Texture* tex = make_text_texture(sdl_renderer_, "Cancel", btn_h - 12,
+                                             240, 240, 245, &tw, &th);
+        if (tex) {
+            SDL_Rect d = {r.x + (r.w - tw) / 2, r.y + (r.h - th) / 2, tw, th};
+            SDL_SetTextureAlphaMod(tex, text_alpha);
+            SDL_RenderCopy(sdl_renderer_, tex, nullptr, &d);
+            SDL_DestroyTexture(tex);
+        }
+    }
+}
+
 void Renderer::android_submit() {
     auto fail = [&](const std::string& m) {
         std::lock_guard lk(android_status_mutex_);
@@ -6528,6 +6790,11 @@ void Renderer::draw_android_panel() {
     int svy = frame_dst_y_ + (int)(phone_frame_.screen_y() * scale);
     int svw = (int)(phone_frame_.screen_width() * scale);
     int svh = (int)(phone_frame_.screen_height() * scale);
+
+    if (android_qr_active_.load()) {
+        draw_android_qr(svx, svy, svw, svh);
+        return;
+    }
 
     // Cap panel width using the phone-equivalent reference so the dialog
     // (and every glyph derived from `panel_w`) stays compact when mirroring
@@ -6617,6 +6884,7 @@ void Renderer::draw_android_panel() {
                 + discover_section_h
                 + (label_h + 6 + field_h + gap) * 2   // 2 rows of 2 fields
                 + label_h * status_rows + gap            // status line(s)
+                + btn_h + gap                            // QR pairing button row
                 + btn_h + pad + btn_bottom_pad;
 
     int panel_x = svx + (svw - panel_w) / 2;
@@ -6926,6 +7194,8 @@ void Renderer::draw_android_panel() {
 
     // Buttons
     int bw = (panel_w - pad*2 - gap) / 2;
+    android_qr_btn_         = {panel_x + pad, cy, panel_w - pad*2, btn_h};
+    cy += btn_h + gap;
     android_connect_btn_    = {panel_x + pad,           cy, bw, btn_h};
     android_disconnect_btn_ = {panel_x + pad + bw + gap, cy, bw, btn_h};
 
@@ -6947,6 +7217,7 @@ void Renderer::draw_android_panel() {
             SDL_DestroyTexture(tex);
         }
     };
+    draw_btn(android_qr_btn_,         "Pair with QR code", false);
     draw_btn(android_connect_btn_,    android_busy_ ? "Working..." : "Connect", true);
     draw_btn(android_disconnect_btn_, "Disconnect", false);
 }

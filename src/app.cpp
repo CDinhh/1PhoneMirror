@@ -366,6 +366,12 @@ bool App::init(const Config& config) {
                 std::thread([this]() { android_disconnect(); }).detach();
             });
 
+        renderer_.set_android_qr_handler(
+            [this](const std::string& name, const std::string& password,
+                   std::function<bool()> cancelled) {
+                return android_pair_via_qr(name, password, std::move(cancelled));
+            });
+
         // Auto-discover Android devices on the LAN by polling adb's own
         // mDNS browser. This intentionally bypasses the IP that Samsung's
         // Wireless Debugging screen reports (which can be the CGNAT

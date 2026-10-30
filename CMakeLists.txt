@@ -69,6 +69,7 @@ set(CORE_SOURCES
     ${NETWORK_SOURCES}
     lib/stb_image_write_impl.c
     lib/stb_image_impl.c
+    lib/qrcodegen/qrcodegen.cpp
 )
 
 if(ENABLE_AIRPLAY)
