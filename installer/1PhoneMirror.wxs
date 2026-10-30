@@ -9,7 +9,7 @@
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
 
   <Package Name="1PhoneMirror"
-           Manufacturer="Simon Skotheimsvik"
+           Manufacturer="CDinhh"
            Version="$(Version)"
            UpgradeCode="6F4E6B5C-2E4A-4B1F-9D2E-7B5C8F3A1E10"
            Compressed="yes"
@@ -17,7 +17,7 @@
            Scope="perMachine">
 
     <SummaryInformation Description="1PhoneMirror — wireless screen mirroring for iOS and Android"
-                        Manufacturer="Simon Skotheimsvik" />
+                        Manufacturer="CDinhh" />
 
     <!-- Block downgrades, allow seamless upgrades. -->
     <MajorUpgrade DowngradeErrorMessage="A newer version of 1PhoneMirror is already installed." />

@@ -6647,7 +6647,7 @@ void Renderer::draw_android_qr(int svx, int svy, int svw, int svh) {
         panel_y = svy + svh - total_h - bottom_margin;
     if (panel_y < svy + 4) panel_y = svy + 4;
     panel_y -= (int)((1.0f - android_panel_anim_) * 30);
-    uint8_t alpha      = (uint8_t)(245 * android_panel_anim_);
+    uint8_t alpha      = (uint8_t)(255 * android_panel_anim_);
     uint8_t text_alpha = (uint8_t)(255 * android_panel_anim_);
     uint8_t qr_alpha   = (uint8_t)(255 * android_panel_anim_);
 
@@ -7079,7 +7079,7 @@ void Renderer::draw_android_panel() {
     if (panel_y < svy + 4) panel_y = svy + 4;
     int slide_off = (int)((1.0f - android_panel_anim_) * 30);
     panel_y -= slide_off;
-    uint8_t alpha = (uint8_t)(245 * android_panel_anim_);
+    uint8_t alpha = (uint8_t)(255 * android_panel_anim_);
     uint8_t text_alpha = (uint8_t)(255 * android_panel_anim_);
 
     android_panel_rect_ = {panel_x, panel_y, panel_w, total_h};
