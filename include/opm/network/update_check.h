@@ -13,7 +13,7 @@ struct UpdateCheckResult {
     std::string error;                  // human-readable failure reason
 };
 
-// Synchronous GET https://api.github.com/repos/MSEndpointMgr/1PhoneMirror/releases/latest
+// Synchronous GET https://api.github.com/repos/CDinhh/1PhoneMirror/releases/latest
 // Compares the returned tag_name (stripped of any leading 'v') to
 // `current_version` using numeric major.minor.patch ordering.
 // Returns ok=false on any network/parse failure (silent — caller decides

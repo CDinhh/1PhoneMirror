@@ -1809,7 +1809,7 @@ void Renderer::run() {
                             {
                                 std::lock_guard<std::mutex> lk(update_check_mutex_);
                                 url = update_release_url_.empty()
-                                    ? std::string("https://github.com/MSEndpointMgr/1PhoneMirror")
+                                    ? std::string("https://github.com/CDinhh/1PhoneMirror")
                                     : update_release_url_;
                             }
                             ShellExecuteA(nullptr, "open", url.c_str(),
@@ -4435,7 +4435,7 @@ void Renderer::draw_update_banner() {
         ver = update_latest_version_;
     }
     std::string line1 = "Update available: v" + ver;
-    static const std::string kLinkLabel = "github.com/MSEndpointMgr/1PhoneMirror";
+    static const std::string kLinkLabel = "github.com/CDinhh/1PhoneMirror";
 
     if (line1 != update_line1_cached_) {
         if (update_line1_tex_) { SDL_DestroyTexture(update_line1_tex_); update_line1_tex_ = nullptr; }

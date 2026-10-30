@@ -190,7 +190,7 @@ UpdateCheckResult check_for_update(const std::string& current_version) {
         L"api.github.com",
         // Winget currently points at v0.6.1, which is published on GitHub as
         // a prerelease. The /latest endpoint intentionally excludes it.
-        L"/repos/MSEndpointMgr/1PhoneMirror/releases?per_page=1",
+        L"/repos/CDinhh/1PhoneMirror/releases?per_page=1",
         L"1PhoneMirror-UpdateCheck/1.0",
         &status, &err);
 
@@ -215,7 +215,7 @@ UpdateCheckResult check_for_update(const std::string& current_version) {
     r.latest_version   = tag.front() == 'v' ? tag.substr(1) : tag;
     r.release_url      = !html.empty()
                        ? html
-                       : "https://github.com/MSEndpointMgr/1PhoneMirror/releases/latest";
+                       : "https://github.com/CDinhh/1PhoneMirror/releases/latest";
     r.update_available = is_newer(late, cur);
     return r;
 #else

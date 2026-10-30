@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Build, stage, and package 1PhoneMirror into an MSI (and optionally an
     Intune .intunewin) ready for distribution.
